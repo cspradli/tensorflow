@@ -43,7 +43,7 @@ def create_identity_with_grad_check_fn(expected_gradient, expected_dtype=None):
     certain value.
   """
   @custom_gradient.custom_gradient
-  def identity_with_grad_check(x):
+  def _identity_with_grad_check(x):
     """Function that asserts it's gradient has a certain value."""
     x = array_ops.identity(x)
     def grad(dx):
@@ -57,6 +57,10 @@ def create_identity_with_grad_check_fn(expected_gradient, expected_dtype=None):
         dx = array_ops.identity(dx)
       return dx
     return x, grad
+  # Keras sometimes has trouble serializing Lambda layers with a decorated
+  # function. So we define and return a non-decorated function.
+  def identity_with_grad_check(x):
+    return _identity_with_grad_check(x)
   return identity_with_grad_check
 
 
@@ -77,7 +81,7 @@ def create_identity_with_nan_gradients_fn(have_nan_gradients):
     `have_nan_gradients` is True.
   """
   @custom_gradient.custom_gradient
-  def identity_with_nan_gradients(x):
+  def _identity_with_nan_gradients(x):
     """Function whose gradient is NaN iff `have_nan_gradients` is True."""
     x = array_ops.identity(x)
     def grad(dx):
@@ -89,10 +93,12 @@ def create_identity_with_nan_gradients_fn(have_nan_gradients):
         nan_scalar = constant_op.constant(float('NaN'), dtype=dx.dtype)
       return control_flow_ops.cond(
           have_nan_gradients,
-          lambda: array_ops.fill(dx.shape, nan_scalar),
+          lambda: array_ops.fill(array_ops.shape(dx), nan_scalar),
           lambda: dx
       )
     return x, grad
+  # Keras sometimes has trouble serializing Lambda layers with a decorated
+  # function. So we define and return a non-decorated function.
+  def identity_with_nan_gradients(x):
+    return _identity_with_nan_gradients(x)
   return identity_with_nan_gradients
-
-

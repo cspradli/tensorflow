@@ -16,8 +16,10 @@ limitations under the License.
 #ifndef TENSORFLOW_COMPILER_XLA_PYTHON_TYPES_H_
 #define TENSORFLOW_COMPILER_XLA_PYTHON_TYPES_H_
 
+#include <memory>
 #include <vector>
 
+#include "absl/container/inlined_vector.h"
 #include "absl/types/optional.h"
 #include "include/pybind11/numpy.h"
 #include "include/pybind11/pybind11.h"
@@ -53,7 +55,7 @@ StatusOr<pybind11::dtype> PrimitiveTypeToDtype(PrimitiveType type);
 // buffers with the literals. Takes ownership of `literal` and keeps the
 // necessary pieces alive using Python reference counting.
 // Requires the GIL.
-StatusOr<pybind11::object> LiteralToPython(std::unique_ptr<Literal> literal);
+StatusOr<pybind11::object> LiteralToPython(std::shared_ptr<Literal> literal);
 
 // Converts a Python object into an XLA shape and a vector of leaf buffers.
 // The leaf buffers correspond to a depth-first, left-to-right traversal of
@@ -103,7 +105,7 @@ struct type_caster<absl::Span<const T>> {
   using value_conv = make_caster<T>;
 
   PYBIND11_TYPE_CASTER(absl::Span<const T>,
-                       _("Span[") + value_conv::name() + _("]"));
+                       _("Span[") + value_conv::name + _("]"));
 
   // absl::Span doesn't hold ownership. We therefore need a temporary array.
   // Pybind appears to keep type_casters alive until the callee has run.
@@ -150,7 +152,7 @@ struct type_caster<xla::StatusOr<T>> {
   using value_conv = make_caster<T>;
 
   PYBIND11_TYPE_CASTER(xla::StatusOr<T>,
-                       _("StatusOr[") + value_conv::name() + _("]"));
+                       _("StatusOr[") + value_conv::name + _("]"));
 
   static handle cast(xla::StatusOr<T> src, return_value_policy policy,
                      handle parent) {
@@ -174,13 +176,55 @@ struct type_caster<xla::BorrowingLiteral> {
   PYBIND11_TYPE_CASTER(xla::BorrowingLiteral, _("xla::BorrowingLiteral"));
 
   // Pybind appears to keep type_casters alive until the callee has run.
-  pybind11::array array;
+  absl::InlinedVector<pybind11::array, 1> arrays;
 
-  bool load(handle handle, bool) {
-    array = pybind11::array::ensure(
-        handle, pybind11::array::c_style |
-                    pybind11::detail::npy_api::NPY_ARRAY_ALIGNED_);
-    if (!array) return false;
+  bool load(handle input, bool) {
+    // TODO(b/79707221): support nested tuples if/when XLA adds support for
+    // nested BorrowingLiterals.
+    if (pybind11::isinstance<pybind11::tuple>(input)) {
+      pybind11::tuple tuple =
+          pybind11::reinterpret_borrow<pybind11::tuple>(input);
+      std::vector<xla::Shape> shapes;
+      std::vector<const char*> buffers;
+      arrays.reserve(tuple.size());
+      shapes.reserve(tuple.size());
+      buffers.reserve(tuple.size());
+      for (pybind11::handle entry : tuple) {
+        auto c = CastToArray(entry);
+        if (!c) {
+          return false;
+        }
+        arrays.push_back(c->array);
+        buffers.push_back(c->buf_ptr);
+        shapes.push_back(c->shape);
+      }
+      value = xla::BorrowingLiteral(buffers,
+                                    xla::ShapeUtil::MakeTupleShape(shapes));
+    } else {
+      auto c = CastToArray(input);
+      if (!c) {
+        return false;
+      }
+      arrays.push_back(c->array);
+      value = xla::BorrowingLiteral(c->buf_ptr, c->shape);
+    }
+    return true;
+  }
+
+ private:
+  struct CastToArrayResult {
+    pybind11::array array;
+    const char* buf_ptr;
+    xla::Shape shape;
+  };
+
+  absl::optional<CastToArrayResult> CastToArray(pybind11::handle h) {
+    pybind11::array array = pybind11::array::ensure(
+        h, pybind11::array::c_style |
+               pybind11::detail::npy_api::NPY_ARRAY_ALIGNED_);
+    if (!array) {
+      return absl::nullopt;
+    }
     pybind11::buffer_info buffer_info = array.request();
 
     absl::InlinedVector<xla::int64, 4> dims(array.ndim());
@@ -198,9 +242,8 @@ struct type_caster<xla::BorrowingLiteral> {
           "Size mismatch for buffer: ", buffer_info.size * buffer_info.itemsize,
           " vs. ", xla::ShapeUtil::ByteSizeOf(shape)));
     }
-    value =
-        xla::BorrowingLiteral(static_cast<const char*>(buffer_info.ptr), shape);
-    return true;
+    return CastToArrayResult{array, static_cast<const char*>(buffer_info.ptr),
+                             shape};
   }
 };
 
@@ -423,6 +466,29 @@ struct type_caster<xla::OpMetadata> {
     return true;
   }
 };
+
+template <>
+struct type_caster<xla::PrecisionConfig> {
+ public:
+  PYBIND11_TYPE_CASTER(xla::PrecisionConfig, _("xla::PrecisionConfig"));
+
+  // PyObject -> C++ conversion.
+  bool load(handle handle, bool) {
+    if (handle.is_none()) {
+      return true;
+    }
+
+    sequence operand_precisions =
+        reinterpret_borrow<sequence>(getattr(handle, "operand_precision"));
+
+    for (auto operand_precision : operand_precisions) {
+      value.add_operand_precision(
+          operand_precision.cast<xla::PrecisionConfig::Precision>());
+    }
+    return true;
+  }
+};
+
 }  // namespace detail
 }  // namespace pybind11
 

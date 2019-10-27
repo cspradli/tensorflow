@@ -17,6 +17,7 @@ limitations under the License.
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
@@ -24,7 +25,7 @@ limitations under the License.
 
 #include "tensorflow/lite/c/builtin_op_data.h"
 #include "tensorflow/lite/c/c_api_internal.h"
-#include "tensorflow/lite/kernels/cpu_backend_support.h"
+#include "tensorflow/lite/kernels/cpu_backend_context.h"
 #include "tensorflow/lite/kernels/eigen_support.h"
 // b/131835803 forces us to include multithreaded_conv.h before optimized_ops.h
 #ifndef TFLITE_WITH_RUY
@@ -115,13 +116,11 @@ void* Init(TfLiteContext* context, const char* buffer, size_t length) {
   // to carry information from Prepare() to Eval().
   auto* data = new OpData;
   eigen_support::IncrementUsageCounter(context);
-  cpu_backend_support::IncrementUsageCounter(context);
   return data;
 }
 
 void Free(TfLiteContext* context, void* buffer) {
   eigen_support::DecrementUsageCounter(context);
-  cpu_backend_support::DecrementUsageCounter(context);
   delete reinterpret_cast<OpData*>(buffer);
 }
 
@@ -472,7 +471,7 @@ void EvalQuantized(TfLiteContext* context, TfLiteNode* node,
           GetTensorShape(bias), GetTensorData<int32_t>(bias),
           GetTensorShape(output), GetTensorData<uint8_t>(output),
           GetTensorShape(im2col), GetTensorData<uint8_t>(im2col),
-          cpu_backend_support::GetFromContext(context));
+          CpuBackendContext::GetFromContext(context));
       break;
     }
   }
@@ -516,7 +515,7 @@ void EvalQuantizedPerChannel(TfLiteContext* context, TfLiteNode* node,
           GetTensorData<int32>(bias), GetTensorShape(output),
           GetTensorData<int8>(output), GetTensorShape(im2col),
           GetTensorData<int8>(im2col),
-          cpu_backend_support::GetFromContext(context));
+          CpuBackendContext::GetFromContext(context));
       break;
     }
   }
@@ -564,7 +563,7 @@ void EvalFloat(TfLiteContext* context, TfLiteNode* node,
                           GetTensorData<float>(bias), GetTensorShape(output),
                           GetTensorData<float>(output), GetTensorShape(im2col),
                           GetTensorData<float>(im2col),
-                          cpu_backend_support::GetFromContext(context));
+                          CpuBackendContext::GetFromContext(context));
       break;
     }
     case kMultithreadOptimized: {
@@ -605,37 +604,20 @@ void EvalHybrid(TfLiteContext* context, TfLiteNode* node,
   const int input_size = NumElements(input) / SizeOfDimension(input, 0);
   const int batch_size = SizeOfDimension(input, 0);
 
-  const TfLiteTensor* input_quantized =
-      GetTemporary(context, node, data->input_quantized_index);
-  int8_t* quantized_input_ptr_batch = input_quantized->data.int8;
-  float* scaling_factors_ptr =
-      GetTemporary(context, node, data->scaling_factors_index)->data.f;
+  float* input_ptr = GetTensorData<float>(input);
+  int8_t* quantized_input_ptr_batch = GetTensorData<int8_t>(
+      GetTemporary(context, node, data->input_quantized_index));
+  float* scaling_factors_ptr = GetTensorData<float>(
+      GetTemporary(context, node, data->scaling_factors_index));
 
   // Per-batch input quantization for higher accuracy.
   for (int b = 0; b < batch_size; ++b) {
     float unused_min, unused_max;
     const int offset = b * input_size;
     tensor_utils::SymmetricQuantizeFloats(
-        input->data.f + offset, input_size, quantized_input_ptr_batch + offset,
+        input_ptr + offset, input_size, quantized_input_ptr_batch + offset,
         &unused_min, &unused_max, &scaling_factors_ptr[b]);
     scaling_factors_ptr[b] *= filter->params.scale;
-  }
-
-  int8_t* im2col_ptr = nullptr;
-  int8_t* filter_ptr = nullptr;
-  if (filter->type == kTfLiteUInt8) {
-    // For backward compatibility, we need to support the case where filters
-    // are quantized to int8 but stored as uint8.
-    if (im2col != nullptr) {
-      im2col_ptr = reinterpret_cast<int8_t*>(im2col->data.uint8);
-    }
-    filter_ptr = reinterpret_cast<int8_t*>(filter->data.uint8);
-  } else {
-    // Code at head uses the int8 type so we do not need to do the cast.
-    if (im2col != nullptr) {
-      im2col_ptr = im2col->data.int8;
-    }
-    filter_ptr = filter->data.int8;
   }
 
   switch (kernel_type) {
@@ -657,10 +639,11 @@ void EvalHybrid(TfLiteContext* context, TfLiteNode* node,
       op_params.float_activation_max = output_activation_max;
       optimized_ops::HybridConv(
           op_params, scaling_factors_ptr, GetTensorShape(input),
-          quantized_input_ptr_batch, GetTensorShape(filter), filter_ptr,
-          GetTensorShape(bias), GetTensorData<float>(bias),
-          GetTensorShape(output), GetTensorData<float>(output),
-          GetTensorShape(im2col), im2col_ptr);
+          quantized_input_ptr_batch, GetTensorShape(filter),
+          GetTensorData<int8_t>(filter), GetTensorShape(bias),
+          GetTensorData<float>(bias), GetTensorShape(output),
+          GetTensorData<float>(output), GetTensorShape(im2col),
+          GetTensorData<int8_t>(im2col));
       break;
     }
   }
